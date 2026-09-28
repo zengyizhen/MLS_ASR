@@ -5,6 +5,7 @@ End-to-end implementation using Triton kernels
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from typing import Optional, Tuple
@@ -55,7 +56,7 @@ def attention_scores_kernel(
         q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2,
         mask=offs_d < head_dim,
         other=0.0,
-    )
+    ).to(tl.float32)
     k = tl.load(
         k_ptr
         + pid_bh * stride_k0
@@ -63,7 +64,7 @@ def attention_scores_kernel(
         + offs_d[None, :] * stride_k2,
         mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
         other=0.0,
-    )
+    ).to(tl.float32)
     scores = tl.sum(k * q[None, :], axis=1) * scale
     tl.store(
         scores_ptr
@@ -130,7 +131,7 @@ def attention_output_kernel(
         + offs_k * stride_w2,
         mask=offs_k < seq_k,
         other=0.0,
-    )
+    ).to(tl.float32)
     v = tl.load(
         v_ptr
         + pid_bh * stride_v0
@@ -138,7 +139,7 @@ def attention_output_kernel(
         + offs_d[None, :] * stride_v2,
         mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
         other=0.0,
-    )
+    ).to(tl.float32)
     out = tl.sum(v * w[:, None], axis=0)
     tl.store(
         output_ptr
@@ -287,37 +288,39 @@ def scaled_dot_product_attention(
     )
 
     if use_triton:
-        q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32)
-        k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
-        v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
+        q_flat = q.reshape(batch * num_heads, seq_q, head_dim).contiguous()
+        k_flat = k.reshape(batch * num_heads, seq_k, head_dim).contiguous()
+        v_flat = v.reshape(batch * num_heads, seq_k, head_dim).contiguous()
+
+        compute_dtype = torch.float32
 
         if seq_k_padded != seq_k or head_dim_padded != head_dim:
             k_padded = torch.zeros(
                 (batch * num_heads, seq_k_padded, head_dim_padded),
-                dtype=torch.float32,
+                dtype=compute_dtype,
                 device=q.device,
             )
             v_padded = torch.zeros_like(k_padded)
             q_padded = torch.zeros(
                 (batch * num_heads, seq_q, head_dim_padded),
-                dtype=torch.float32,
+                dtype=compute_dtype,
                 device=q.device,
             )
-            k_padded[:, :seq_k, :head_dim] = k_flat
-            v_padded[:, :seq_k, :head_dim] = v_flat
-            q_padded[:, :, :head_dim] = q_flat
+            k_padded[:, :seq_k, :head_dim] = k_flat.to(compute_dtype)
+            v_padded[:, :seq_k, :head_dim] = v_flat.to(compute_dtype)
+            q_padded[:, :, :head_dim] = q_flat.to(compute_dtype)
             k_flat = k_padded
             v_flat = v_padded
             q_flat = q_padded
 
         scores = torch.empty(
             (batch * num_heads, seq_q, seq_k_padded),
-            dtype=torch.float32,
+            dtype=compute_dtype,
             device=q.device,
         )
         output = torch.empty(
             (batch * num_heads, seq_q, head_dim_padded),
-            dtype=torch.float32,
+            dtype=compute_dtype,
             device=q.device,
         )
 
@@ -398,6 +401,22 @@ def scaled_dot_product_attention(
             output = output[:, :, :head_dim]
 
         return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
+
+    # For larger sequence/head dimensions, prefer PyTorch SDPA backend on CUDA.
+    # This path can hit FlashAttention/mem-efficient attention kernels.
+    if q.is_cuda:
+        attn_mask = attention_mask
+        if attn_mask is not None and attn_mask.dtype != q.dtype:
+            attn_mask = attn_mask.to(q.dtype)
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=is_causal,
+            scale=scale,
+        )
 
     scores = torch.einsum("bnqd,bnkd->bnqk", q, k) * scale
 
